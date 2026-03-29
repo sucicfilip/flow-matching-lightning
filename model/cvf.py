@@ -231,6 +231,19 @@ class GaussianConditionalProbabilityPath(ConditionalProbabilityPath):
 
         return (dt_alpha_t - dt_beta_t / beta_t * alpha_t) * z + dt_beta_t / beta_t * x
 
+    def mean_vector_field(self, x: torch.Tensor, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluates the mean (chord) vector field:
+            ū_t(x|z) = (z - x) / (1 - t)
+
+        This is the average velocity needed to travel directly from x_t to z.
+        Equivalent to conditional_vector_field for linear paths, but differs
+        for non-linear schedules (e.g. cosine). Enables one-step inference:
+            z ≈ x_t + (1 - t) * u_theta(x_t, t, y)
+        """
+        eps = 1e-5  # avoid division by zero near t=1
+        return (z - x) / (1 - t + eps)
+
     def conditional_score(self, x: torch.Tensor, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         Evaluates the conditional score of p_t(x|z)

@@ -1,7 +1,7 @@
 import lightning as L
 import torch
 import yaml
-from model.module import FlowMatchingModule
+from model.module import FlowMatchingModule, MeanFlowModule
 from data_module import MNISTDataModule
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -27,7 +27,7 @@ def train_model(model_cfg: dict, train_cfg: dict, data_cfg: dict):
     )
 
     #initialize model
-    model = FlowMatchingModule(model_cfg, train_cfg)
+    model = MeanFlowModule(model_cfg, train_cfg)
     if model_cfg['compile']:
         model = torch.compile(model)
 

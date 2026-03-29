@@ -10,6 +10,75 @@ from torchmetrics import MeanMetric
 
 optimizer_map = {'adamW': AdamW, 'adam': Adam}
 
+
+class MeanFlowModule(L.LightningModule):
+    def __init__(self, model_cfg: dict, train_cfg: dict):
+        super().__init__()
+        self.save_hyperparameters(logger=False)
+
+        self.model = MNISTUNet(
+            channels=model_cfg['channels'],
+            num_residual_layers=model_cfg['num_residual_layers'],
+            t_embed_dim=model_cfg['t_embed_dim'],
+            y_embed_dim=model_cfg['y_embed_dim'],
+        )
+
+        self.eta = model_cfg['eta']
+
+        self.path = GaussianConditionalProbabilityPath(
+            p_simple_shape=model_cfg['input_size'],
+            alpha=LinearAlpha(),
+            beta=LinearBeta(),
+        )
+
+        self.optimizer_type = optimizer_map[train_cfg['optimizer']]
+        self.learning_rate = train_cfg['learning_rate']
+        self.monitor = train_cfg['early_stopping_val']
+
+        self.metrics = nn.ModuleDict()
+        for split in ['train/', 'val/', 'test/']:
+            self.metrics[split] = MeanMetric()
+
+    def model_step(self, batch, data_split, batch_idx):
+        z, y = batch
+        batch_size = z.shape[0]
+
+        mask = torch.rand(batch_size) > self.eta
+        y[mask] = 10
+
+        t = torch.rand(batch_size, 1, 1, 1, device=z.device)
+        x = self.path.sample_conditional_path(z, t)
+
+        u_pred = self.model(x, t, y)
+        u_mean = self.path.mean_vector_field(x, z, t)
+        loss = torch.mean((u_pred - u_mean) ** 2)
+
+        self.metrics[data_split](loss)
+        self.log(f'{data_split}mf_loss', self.metrics[data_split], on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self.model_step(batch, "train/", batch_idx)
+
+    def validation_step(self, batch, batch_idx):
+        self.model_step(batch, "val/", batch_idx)
+
+    def test_step(self, batch, batch_idx):
+        self.model_step(batch, "test/", batch_idx)
+
+    def configure_optimizers(self):
+        optimizer = self.optimizer_type(
+            params=self.trainer.model.parameters(),
+            lr=self.learning_rate,
+            amsgrad=True,
+        )
+        scheduler = ReduceLROnPlateau(optimizer=optimizer)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "monitor": self.monitor},
+        }
+
+
 class FlowMatchingModule(L.LightningModule):
     def __init__(self, model_cfg: dict, train_cfg: dict):
         super().__init__()
