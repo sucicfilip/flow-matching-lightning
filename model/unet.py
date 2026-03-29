@@ -32,12 +32,12 @@ class ResidualLayer(nn.Module):
         super().__init__()
         self.block1 = nn.Sequential(
             nn.SiLU(),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(8, channels),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         )
         self.block2 = nn.Sequential(
             nn.SiLU(),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(8, channels),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         )
         # Converts (bs, time_embed_dim) -> (bs, channels)
@@ -153,7 +153,7 @@ class MNISTUNet(ConditionalVectorField):
     def __init__(self, channels: List[int], num_residual_layers: int, t_embed_dim: int, y_embed_dim: int):
         super().__init__()
         # Initial convolution: (bs, 1, 32, 32) -> (bs, c_0, 32, 32)
-        self.init_conv = nn.Sequential(nn.Conv2d(1, channels[0], kernel_size=3, padding=1), nn.BatchNorm2d(channels[0]), nn.SiLU())
+        self.init_conv = nn.Sequential(nn.Conv2d(1, channels[0], kernel_size=3, padding=1), nn.GroupNorm(8, channels[0]), nn.SiLU())
 
         # Initialize time embedders (t and r are both embedded and summed)
         self.time_embedder = FourierEncoder(t_embed_dim)

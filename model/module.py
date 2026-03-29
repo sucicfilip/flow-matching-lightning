@@ -94,7 +94,6 @@ class MeanFlowModule(L.LightningModule):
             lambda x, t_, r_: self.model(x, t_, r_, y_fixed),
             (x_t, t, r),
             (v, torch.ones_like(t), torch.zeros_like(r)),
-            create_graph=True,  # needed so gradients flow back through u
         )
 
         # Mean flow target (stop-gradient): u_tgt = v + (r - t) * dudt
