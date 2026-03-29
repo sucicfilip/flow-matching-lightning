@@ -21,7 +21,7 @@ train:
   learning_rate: 0.001 #learning rate for optimizer
   seed: 250325 #random seed
   max_grad_norm: 5.0 #maximum norm of the gradients for clipping
-  patience: 10 # number of checks with no improvement after which training will be stopped
+  patience: 30 # number of checks with no improvement after which training will be stopped
   early_stopping_val: val/mf_loss #loss value to monitor for early stopping
   save_path: results/ # directory for saving training runs
   run_name: mnist_cfm #name of single run folder to store model checkpoints and logs

@@ -67,7 +67,7 @@ class MeanFlowModule(L.LightningModule):
         batch_size = z.shape[0]
 
         # CFG dropout: replace label with null token (10) with probability eta
-        mask = torch.rand(batch_size) > self.eta
+        mask = torch.rand(batch_size) < self.eta
         y[mask] = 10
 
         # Sample two timesteps t <= r, both in [0, 1]
@@ -172,7 +172,7 @@ class FlowMatchingModule(L.LightningModule):
         batch_size = z.shape[0]
 
         # Step 2: Set each label to 10 (i.e., null) with probability eta
-        mask = torch.rand(batch_size) > self.eta
+        mask = torch.rand(batch_size) < self.eta
         y[mask] = 10
 
         # Step 3: Sample t and x
