@@ -7,7 +7,6 @@ from torchvision.utils import make_grid
 model_path = "path/to/model.ckpt"  # <-- promijeni ovo
 
 # ── parameters ───────────────────────────────────────────────────────────────
-num_steps_list   = [1, 5, 20]   # usporedi različit broj koraka
 guidance_scales  = [1.0, 3.0]
 samples_per_class = 10
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -61,20 +60,15 @@ mf_module = load_module(model_path)
 
 y = torch.arange(10, dtype=torch.int64, device=device).repeat_interleave(samples_per_class)
 
-fig, axes = plt.subplots(
-    len(guidance_scales), len(num_steps_list),
-    figsize=(6 * len(num_steps_list), 6 * len(guidance_scales))
-)
+fig, axes = plt.subplots(1, len(guidance_scales), figsize=(10 * len(guidance_scales), 10))
 
-for row, w in enumerate(guidance_scales):
-    for col, n_steps in enumerate(num_steps_list):
-        images = sample_mean_flow(mf_module, y, num_steps=n_steps, guidance_scale=w)
-        grid = make_grid(images, nrow=samples_per_class, normalize=True, value_range=(-1, 1))
+for idx, w in enumerate(guidance_scales):
+    images = sample_mean_flow(mf_module, y, num_steps=1, guidance_scale=w)
+    grid = make_grid(images, nrow=samples_per_class, normalize=True, value_range=(-1, 1))
 
-        ax = axes[row][col] if len(guidance_scales) > 1 else axes[col]
-        ax.imshow(grid.permute(1, 2, 0).cpu(), cmap="gray")
-        ax.axis("off")
-        ax.set_title(f"steps={n_steps}, w={w:.1f}", fontsize=16)
+    axes[idx].imshow(grid.permute(1, 2, 0).cpu(), cmap="gray")
+    axes[idx].axis("off")
+    axes[idx].set_title(f"Guidance: $w={w:.1f}$", fontsize=25)
 
 plt.tight_layout()
 plt.savefig("demo_mean_flow.png", dpi=150)
