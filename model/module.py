@@ -1,6 +1,7 @@
 import lightning as L
 import torch
 from torch import nn
+from torch.func import jvp
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from model.unet import MNISTUNet
@@ -12,6 +13,16 @@ optimizer_map = {'adamW': AdamW, 'adam': Adam}
 
 
 class MeanFlowModule(L.LightningModule):
+    """
+    Mean Flow training module following arxiv:2505.13447.
+
+    Key difference from standard flow matching:
+    - Model takes two timesteps (t, r) with r >= t
+    - Loss target uses a JVP correction: u_tgt = v + (r - t) * du/dt
+    - This trains the model to predict the *mean* velocity over [t, r],
+      enabling better few-step (or one-step) generation at inference.
+    - For r == t the JVP term vanishes and it reduces to standard FM.
+    """
     def __init__(self, model_cfg: dict, train_cfg: dict):
         super().__init__()
         self.save_hyperparameters(logger=False)
@@ -24,6 +35,8 @@ class MeanFlowModule(L.LightningModule):
         )
 
         self.eta = model_cfg['eta']
+        # Fraction of batch where r=t (reduces to standard FM step, no JVP cost)
+        self.flow_ratio = 0.5
 
         self.path = GaussianConditionalProbabilityPath(
             p_simple_shape=model_cfg['input_size'],
@@ -39,19 +52,57 @@ class MeanFlowModule(L.LightningModule):
         for split in ['train/', 'val/', 'test/']:
             self.metrics[split] = MeanMetric()
 
+    def _adaptive_l2_loss(self, error: torch.Tensor, gamma: float = 0.5, c: float = 1e-3) -> torch.Tensor:
+        """
+        Adaptive L2 loss from the paper (eq. in Sec 3.2).
+        Down-weights samples with large errors so training is more stable.
+        """
+        delta_sq = torch.mean(error ** 2, dim=(1, 2, 3))  # (bs,)
+        p = 1.0 - gamma
+        w = (delta_sq + c).pow(-p).detach()  # stop-gradient on weights
+        return (w * delta_sq).mean()
+
     def model_step(self, batch, data_split, batch_idx):
         z, y = batch
         batch_size = z.shape[0]
 
+        # CFG dropout: replace label with null token (10) with probability eta
         mask = torch.rand(batch_size) > self.eta
         y[mask] = 10
 
-        t = torch.rand(batch_size, 1, 1, 1, device=z.device)
-        x = self.path.sample_conditional_path(z, t)
+        # Sample two timesteps t <= r, both in [0, 1]
+        # (t=current position on path, r=reference/target position closer to data)
+        s1 = torch.rand(batch_size, 1, 1, 1, device=z.device)
+        s2 = torch.rand(batch_size, 1, 1, 1, device=z.device)
+        t = torch.minimum(s1, s2)
+        r = torch.maximum(s1, s2)
 
-        u_pred = self.model(x, t, y)
-        u_mean = self.path.mean_vector_field(x, z, t)
-        loss = torch.mean((u_pred - u_mean) ** 2)
+        # For flow_ratio fraction of samples, collapse r=t (standard FM step)
+        collapse = torch.rand(batch_size, device=z.device) < self.flow_ratio
+        r = torch.where(collapse.view(-1, 1, 1, 1), t, r)
+
+        # Interpolate: x_t = t*z + (1-t)*eps  (t=0 is noise, t=1 is data)
+        eps = torch.randn_like(z)
+        x_t = t * z + (1 - t) * eps
+        v = z - eps  # instantaneous velocity (points toward data)
+
+        # JVP: compute u = model(x_t, t, r) and dudt = d/dt[u] along the trajectory
+        # Tangents: dx_t/dt = v (trajectory velocity), dt/dt = 1, dr/dt = 0
+        # Result: dudt = ∂u/∂x_t * v + ∂u/∂t
+        y_fixed = y  # y is not differentiated — captured in closure
+        u, dudt = jvp(
+            lambda x, t_, r_: self.model(x, t_, r_, y_fixed),
+            (x_t, t, r),
+            (v, torch.ones_like(t), torch.zeros_like(r)),
+            create_graph=True,  # needed so gradients flow back through u
+        )
+
+        # Mean flow target (stop-gradient): u_tgt = v + (r - t) * dudt
+        # When r=t: reduces to v (standard FM)
+        # When r>t: JVP correction makes target the *mean* velocity over [t,r]
+        u_tgt = (v + (r - t) * dudt).detach()
+
+        loss = self._adaptive_l2_loss(u - u_tgt)
 
         self.metrics[data_split](loss)
         self.log(f'{data_split}mf_loss', self.metrics[data_split], on_step=False, on_epoch=True, prog_bar=True)
@@ -131,7 +182,7 @@ class FlowMatchingModule(L.LightningModule):
         x = self.path.sample_conditional_path(z, t)
 
         # Step 4: Regress and output loss
-        u_t_theta = self.model(x, t, y)
+        u_t_theta = self.model(x, t, t, y)  # r=t for standard flow matching
         u_ref = self.path.conditional_vector_field(x, z, t)
         cfm_loss = torch.mean((u_t_theta - u_ref) ** 2)
 

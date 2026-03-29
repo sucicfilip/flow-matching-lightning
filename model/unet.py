@@ -155,8 +155,9 @@ class MNISTUNet(ConditionalVectorField):
         # Initial convolution: (bs, 1, 32, 32) -> (bs, c_0, 32, 32)
         self.init_conv = nn.Sequential(nn.Conv2d(1, channels[0], kernel_size=3, padding=1), nn.BatchNorm2d(channels[0]), nn.SiLU())
 
-        # Initialize time embedder
+        # Initialize time embedders (t and r are both embedded and summed)
         self.time_embedder = FourierEncoder(t_embed_dim)
+        self.r_embedder = FourierEncoder(t_embed_dim)
 
         # Initialize y embedder
         self.y_embedder = nn.Embedding(num_embeddings = 11, embedding_dim = y_embed_dim)
@@ -175,17 +176,18 @@ class MNISTUNet(ConditionalVectorField):
         # Final convolution
         self.final_conv = nn.Conv2d(channels[0], 1, kernel_size=3, padding=1)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor, t: torch.Tensor, r: torch.Tensor, y: torch.Tensor):
         """
         Args:
         - x: (bs, 1, 32, 32)
-        - t: (bs, 1, 1, 1)
+        - t: (bs, 1, 1, 1) — current time
+        - r: (bs, 1, 1, 1) — reference time (r >= t; pass r=t for standard FM)
         - y: (bs,)
         Returns:
         - u_t^theta(x|y): (bs, 1, 32, 32)
         """
-        # Embed t and y
-        t_embed = self.time_embedder(t) # (bs, time_embed_dim)
+        # Embed t, r and y; combine t and r into a single embedding
+        t_embed = self.time_embedder(t) + self.r_embedder(r) # (bs, time_embed_dim)
         y_embed = self.y_embedder(y) # (bs, y_embed_dim)
 
         # Initial convolution

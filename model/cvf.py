@@ -265,11 +265,12 @@ class ConditionalVectorField(nn.Module, ABC):
     """
 
     @abstractmethod
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor, t: torch.Tensor, r: torch.Tensor, y: torch.Tensor):
         """
         Args:
         - x: (bs, c, h, w)
-        - t: (bs, 1, 1, 1)
+        - t: (bs, 1, 1, 1) — current time
+        - r: (bs, 1, 1, 1) — reference time (r >= t; pass r=t for standard FM)
         - y: (bs,)
         Returns:
         - u_t^theta(x|y): (bs, c, h, w)
@@ -296,11 +297,11 @@ class CFGVectorFieldODE(nn.Module):
         - t: (bs, 1, 1, 1)
         - y: (bs,)
         """
-        guided_vector_field = self.net(x, t, y)
+        guided_vector_field = self.net(x, t, t, y)
 
         #unguided VF: 10 is the null label
         unguided_y = torch.ones_like(y) * 10
-        unguided_vector_field = self.net(x, t, unguided_y)
+        unguided_vector_field = self.net(x, t, t, unguided_y)
 
         #weighted linear combination of guided and unguided
         return (1 - self.guidance_scale) * unguided_vector_field + self.guidance_scale * guided_vector_field
