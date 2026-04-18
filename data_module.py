@@ -28,11 +28,12 @@ class MNISTDataModule(L.LightningDataModule):
         self.mnist_val: Optional[Dataset] = None
         self.mnist_test: Optional[Dataset] = None
 
-        #transform to tensor and normalize images
+        #transform to tensor, dequantize, and normalize images
         self.transform = transforms.Compose([
-            transforms.Resize((32, 32)), 
-            transforms.ToTensor(), 
-            transforms.Normalize((0.5,), (0.5,))
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),                       # [0, 1]
+            transforms.Lambda(lambda x: x + torch.rand_like(x) / 256.0),  # dequantize
+            transforms.Normalize((0.5,), (0.5,))         # [-1, 1]
         ])
         
         self.data_dir = data_dir
