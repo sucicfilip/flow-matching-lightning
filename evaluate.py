@@ -81,8 +81,14 @@ def compute_nll_batch(module, x_data, y, num_steps=100):
     # change-of-variables: log p_1(x_1) = log p_0(x_0) - int div(v) dt
     log_p1 = log_p0 - total_div
 
-    nll = -log_p1
-    bpd = nll / (D * math.log(2))
+    # model operates in [-1, 1], transform from [0, 1]: x_model = 2*x_01 - 1
+    # Jacobian correction: log p_01(x) = log p_model(x) + D*log(2)
+    log_p1_01 = log_p1 + D * math.log(2)
+
+    # discrete BPD: dequantization gives lower bound on discrete log-likelihood
+    # BPD = (-log_p_01 + D*log(256)) / (D*log(2))  =  -log_p_01/(D*log2) + 8
+    nll = -log_p1_01
+    bpd = nll / (D * math.log(2)) + 8.0
     return nll, bpd
 
 
@@ -226,8 +232,8 @@ def main():
         print(f"  BPD:          {res['bpd_mean']:.4f} +/- {res['bpd_std']:.4f}")
         print(f"  Samples:      {res['n_samples']}")
         print()
-        print("  Note: BPD is in model space (data in [-1,1]).")
-        print("  For [0,1]-space BPD (comparable to papers), subtract 1.0.")
+        print("  BPD accounts for [-1,1]->[0,1] Jacobian + 256-level discretization.")
+        print("  Comparable to paper values (e.g. ~1.0 for good MNIST models).")
 
     # ── FID ───────────────────────────────────────────────────────────────
     if not args.skip_fid:
