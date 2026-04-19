@@ -143,22 +143,40 @@ def load_meanflow_dit(checkpoint, device):
     from models.dit import MFDiT
     from meanflow import MeanFlow
 
+    # infer architecture from checkpoint weights
+    sd = torch.load(checkpoint, map_location=device, weights_only=True)
+    dim = sd["x_embedder.proj.bias"].shape[0]
+    depth = max(int(k.split(".")[1]) for k in sd if k.startswith("blocks.")) + 1
+    num_heads = sd["blocks.0.attn.qkv.bias"].shape[0] // (3 * (dim // (sd["blocks.0.attn.qkv.bias"].shape[0] // 3 // (dim // 64))))
+    # simpler: qkv has shape (3*num_heads*head_dim,) and head_dim=dim//num_heads
+    # so qkv_dim = 3*dim, num_heads = qkv_dim / 3 / head_dim
+    # but we don't know head_dim... just try common values
+    qkv_dim = sd["blocks.0.attn.qkv.bias"].shape[0]  # 3 * dim
+    num_heads = dim // 64  # head_dim=64 is default for DiT
+
+    in_channels = sd["x_embedder.proj.weight"].shape[1]
+    num_classes = sd["y_embedder.embedding.weight"].shape[0] - 1
+    patch_size = sd["x_embedder.proj.weight"].shape[2]
+
+    print(f"  Inferred: dim={dim}, depth={depth}, heads={num_heads}, "
+          f"in_ch={in_channels}, classes={num_classes}, patch={patch_size}")
+
     model = MFDiT(
         input_size=32,
-        patch_size=2,
-        in_channels=1,
-        dim=256,
-        depth=6,
-        num_heads=4,
-        num_classes=10,
+        patch_size=patch_size,
+        in_channels=in_channels,
+        dim=dim,
+        depth=depth,
+        num_heads=num_heads,
+        num_classes=num_classes,
     ).to(device)
-    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
+    model.load_state_dict(sd)
     model.eval()
 
     meanflow = MeanFlow(
-        channels=1,
+        channels=in_channels,
         image_size=32,
-        num_classes=10,
+        num_classes=num_classes,
         flow_ratio=0.50,
         time_dist=["lognorm", -0.4, 1.0],
         cfg_ratio=0.10,
