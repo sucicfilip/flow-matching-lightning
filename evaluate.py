@@ -21,6 +21,9 @@ from tqdm import tqdm
 
 from model.module import MeanFlowModule, FlowMatchingModule
 from data_module import MNISTDataModule
+from torchvision.datasets import MNIST
+from torchvision import transforms
+from torch.utils.data import DataLoader
 
 
 # ── Sampling ─────────────────────────────────────────────────────────────────
@@ -71,18 +74,23 @@ def _to_inception_format(images):
     return (images * 255).to(torch.uint8)
 
 
-def _to_inception_format_from_model_space(images):
-    """Convert [-1,1] float (1,32,32) to [0,255] uint8 (3,299,299)."""
-    images = ((images + 1) / 2).clamp(0, 1)
-    return _to_inception_format(images)
+def _get_clean_test_loader(batch_size=250):
+    """MNIST test set without dequantization — clean [0,1] images."""
+    ds = MNIST(
+        "./data", train=False, download=True,
+        transform=transforms.Compose([
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+        ]),
+    )
+    return DataLoader(ds, batch_size=batch_size, num_workers=4)
 
 
-def evaluate_fid(sample_fn, dataloader, num_gen=10000, device="cpu"):
+def evaluate_fid(sample_fn, num_gen=10000, device="cpu"):
     """Compute FID between real test images and generated samples.
 
     Args:
         sample_fn: callable(batch_size) -> images in [0, 1] range, (bs, 1, 32, 32)
-        dataloader: test dataloader
         num_gen: number of samples
         device: device
     """
@@ -90,11 +98,11 @@ def evaluate_fid(sample_fn, dataloader, num_gen=10000, device="cpu"):
 
     fid = FrechetInceptionDistance(feature=2048).to(device)
 
-    # real images
+    # real images — clean, no dequantization, already [0, 1]
+    real_dl = _get_clean_test_loader()
     n_real = 0
-    for x, _ in tqdm(dataloader, desc="FID (real)"):
-        # dataloader images are in [-1, 1] (after Normalize(0.5, 0.5))
-        imgs = _to_inception_format_from_model_space(x.to(device))
+    for x, _ in tqdm(real_dl, desc="FID (real)"):
+        imgs = _to_inception_format(x.to(device))
         fid.update(imgs, real=True)
         n_real += x.shape[0]
         if n_real >= num_gen:
@@ -193,11 +201,6 @@ def main():
     print(f"Model type: {args.model_type}")
     print(f"Loading: {args.checkpoint}")
 
-    # load test data
-    dm = MNISTDataModule(data_dir="./data", batch_size=250)
-    dm.setup("test")
-    test_dl = dm.test_dataloader()
-
     # build sample function that returns images in [0, 1]
     if args.model_type in ("mean_flow", "flow_matching"):
         module = load_lightning(args.checkpoint, args.model_type)
@@ -228,7 +231,7 @@ def main():
         print(f"  guidance={args.guidance}")
     print(f"{'='*50}")
 
-    fid_score = evaluate_fid(sample_fn, test_dl, args.num_gen, device)
+    fid_score = evaluate_fid(sample_fn, args.num_gen, device)
     print(f"  FID:  {fid_score:.2f}")
 
 
