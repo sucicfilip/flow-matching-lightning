@@ -55,23 +55,9 @@ def generate_samples_lightning(module, labels, num_steps, guidance_scale=1.0, me
 
 
 @torch.no_grad()
-def generate_samples_meanflow_dit(model, meanflow, labels, num_steps, device):
-    """Sampling for MeanFlow repo MFDiT (t=1 noise, t=0 data).
-
-    Uses meanflow.sample_each_class logic but with arbitrary labels.
-    """
-    bs = len(labels)
-    z = torch.randn(bs, meanflow.channels, meanflow.image_size, meanflow.image_size, device=device)
-    t_vals = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
-
-    for i in range(num_steps):
-        t = torch.full((bs,), t_vals[i], device=device)
-        r = torch.full((bs,), t_vals[i + 1], device=device)
-        v = model(z, t, r, labels)
-        z = z - (t_vals[i] - t_vals[i + 1]) * v
-
-    z = meanflow.normer.unnorm(z)
-    return z
+def generate_samples_meanflow_dit(model, meanflow, n_per_class, num_steps, device):
+    """Sampling for MeanFlow repo — calls their sample_each_class directly."""
+    return meanflow.sample_each_class(model, n_per_class, sample_steps=num_steps, device=device)
 
 
 # ── FID ──────────────────────────────────────────────────────────────────────
@@ -229,11 +215,11 @@ def main():
         model, meanflow = load_meanflow_dit(args.checkpoint, device)
 
         def sample_fn(bs):
-            labels = torch.randint(0, 10, (bs,), device=device)
+            n_per_class = max(1, bs // 10)
             imgs = generate_samples_meanflow_dit(
-                model, meanflow, labels, args.fid_steps, device,
+                model, meanflow, n_per_class, args.fid_steps, device,
             )
-            return imgs.clamp(0, 1)  # unnorm already gives [0,1]
+            return imgs[:bs].clamp(0, 1)  # unnorm already gives [0,1]
 
     # ── FID ───────────────────────────────────────────────────────────────
     print(f"\n{'='*50}")
