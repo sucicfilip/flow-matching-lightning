@@ -6,6 +6,7 @@ data:
 
 #model parameters
 model:
+  type: mean_flow # mean_flow or flow_matching
   compile: False
   input_size: [1, 32, 32] #MNIST shape is 1(B/W)x32x32
   channels: [32, 64, 128] #number of channels in each layer of UNET

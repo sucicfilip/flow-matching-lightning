@@ -27,7 +27,8 @@ def train_model(model_cfg: dict, train_cfg: dict, data_cfg: dict):
     )
 
     #initialize model
-    model = MeanFlowModule(model_cfg, train_cfg)
+    module_map = {'mean_flow': MeanFlowModule, 'flow_matching': FlowMatchingModule}
+    model = module_map[model_cfg['type']](model_cfg, train_cfg)
     if model_cfg['compile']:
         model = torch.compile(model)
 
