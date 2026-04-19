@@ -1,19 +1,19 @@
 """
-Evaluation metrics for flow matching MNIST model.
+Evaluation metrics for flow matching MNIST models.
 
-Computes:
-  - NLL (negative log-likelihood in nats) via CNF change-of-variables formula
-  - BPD (bits per dimension) = NLL / (D * ln2)
-  - FID (Frechet Inception Distance) between generated and real samples
+Supports three model types:
+  - mean_flow:     MeanFlowModule (our Lightning implementation)
+  - flow_matching: FlowMatchingModule (our Lightning implementation)
+  - meanflow_dit:  MFDiT from the MeanFlow repo (../MeanFlow)
 
 Usage:
-    python evaluate.py --checkpoint path/to/model.ckpt
-    python evaluate.py --checkpoint path/to/model.ckpt --skip_fid
-    python evaluate.py --checkpoint path/to/model.ckpt --skip_nll --guidance 3.0
+    python evaluate.py --checkpoint path/to/model.ckpt --model_type mean_flow
+    python evaluate.py --checkpoint path/to/model.ckpt --model_type flow_matching
+    python evaluate.py --checkpoint path/to/model.pt  --model_type meanflow_dit
 """
 
 import argparse
-import math
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -22,120 +22,13 @@ from tqdm import tqdm
 from model.module import MeanFlowModule, FlowMatchingModule
 from data_module import MNISTDataModule
 
-MODULE_MAP = {
-    "mean_flow": MeanFlowModule,
-    "flow_matching": FlowMatchingModule,
-}
 
-
-# ── NLL / BPD ────────────────────────────────────────────────────────────────
-
-
-def compute_nll_batch(module, x_data, y, num_steps=100):
-    """
-    Per-sample NLL via backward ODE integration + Hutchinson trace estimator.
-
-    Uses the instantaneous change-of-variables formula for CNFs:
-        log p_1(x_1) = log p_0(x_0) - int_0^1 div(v)(x_t, t) dt
-
-    We integrate the ODE backward from t=1 (data) to t=0 (noise), accumulating
-    the divergence along the trajectory.  The trace of the Jacobian is estimated
-    with a single Rademacher probe per step (unbiased, low variance).
-
-    Args:
-        module: trained MeanFlowModule (eval mode)
-        x_data: batch of images (bs, 1, 32, 32) in [-1, 1]
-        y: class labels (bs,)
-        num_steps: number of Euler steps for the backward ODE
-
-    Returns:
-        nll: (bs,) negative log-likelihood in nats
-        bpd: (bs,) bits per dimension
-    """
-    device = x_data.device
-    bs = x_data.shape[0]
-    D = x_data[0].numel()  # 1*32*32 = 1024
-    dt = 1.0 / num_steps
-
-    x = x_data.clone()
-    total_div = torch.zeros(bs, device=device)
-
-    for k in range(num_steps):
-        t_val = 1.0 - k * dt
-        t = torch.full((bs, 1, 1, 1), t_val, device=device)
-
-        x = x.detach().requires_grad_(True)
-
-        # r=t gives instantaneous velocity (mean flow reduces to standard FM)
-        v = module.model(x, t, t, y)
-
-        # Hutchinson trace estimator: tr(dv/dx) ~ eps^T (dv/dx) eps
-        eps = torch.randint(0, 2, x.shape, dtype=x.dtype, device=device) * 2 - 1
-        (vjp,) = torch.autograd.grad(v, x, grad_outputs=eps)
-        div_v = (eps * vjp).sum(dim=(1, 2, 3))
-
-        v = v.detach()
-        x = x.detach()
-
-        total_div = total_div + div_v * dt
-        x = x - v * dt  # Euler step backward
-
-    # log p_0(x_0) under the base distribution N(0, I)
-    log_p0 = -0.5 * (D * math.log(2 * math.pi) + x.pow(2).sum(dim=(1, 2, 3)))
-
-    # change-of-variables: log p_1(x_1) = log p_0(x_0) - int div(v) dt
-    log_p1 = log_p0 - total_div
-
-    # model operates in [-1, 1], transform from [0, 1]: x_model = 2*x_01 - 1
-    # Jacobian correction: log p_01(x) = log p_model(x) + D*log(2)
-    log_p1_01 = log_p1 + D * math.log(2)
-
-    # discrete BPD: dequantization gives lower bound on discrete log-likelihood
-    # BPD = (-log_p_01 + D*log(256)) / (D*log(2))  =  -log_p_01/(D*log2) + 8
-    nll = -log_p1_01
-    bpd = nll / (D * math.log(2)) + 8.0
-    return nll, bpd
-
-
-def evaluate_nll(module, dataloader, num_steps=100, max_samples=1000, device="cpu"):
-    """Evaluate NLL/BPD over the dataset (subsampled to max_samples)."""
-    module.eval()
-    all_nll, all_bpd = [], []
-    n = 0
-
-    for x, y in tqdm(dataloader, desc="NLL"):
-        if n >= max_samples:
-            break
-        remaining = max_samples - n
-        x, y = x[:remaining].to(device), y[:remaining].to(device)
-
-        nll, bpd = compute_nll_batch(module, x, y, num_steps)
-        all_nll.append(nll.detach())
-        all_bpd.append(bpd.detach())
-        n += len(x)
-
-    all_nll = torch.cat(all_nll)
-    all_bpd = torch.cat(all_bpd)
-
-    return {
-        "nll_mean": all_nll.mean().item(),
-        "nll_std": all_nll.std().item(),
-        "bpd_mean": all_bpd.mean().item(),
-        "bpd_std": all_bpd.std().item(),
-        "n_samples": n,
-    }
-
-
-# ── FID ──────────────────────────────────────────────────────────────────────
+# ── Sampling ─────────────────────────────────────────────────────────────────
 
 
 @torch.no_grad()
-def generate_samples(module, labels, num_steps, guidance_scale=1.0, mean_flow=True):
-    """Generate images via ODE integration with optional CFG.
-
-    mean_flow=True:  r=t_next (mean velocity over [t, r] — enables big steps)
-    mean_flow=False: r=t      (instantaneous velocity — standard FM)
-    """
+def generate_samples_lightning(module, labels, num_steps, guidance_scale=1.0, mean_flow=True):
+    """Sampling for our Lightning modules (t=0 noise, t=1 data)."""
     device = next(module.parameters()).device
     bs = len(labels)
     y_null = torch.full_like(labels, 10)
@@ -149,10 +42,7 @@ def generate_samples(module, labels, num_steps, guidance_scale=1.0, mean_flow=Tr
         r = t_sched[i + 1].view(1, 1, 1, 1).expand(bs, 1, 1, 1)
         dt = r - t
 
-        # mean flow: model predicts mean velocity over [t, r]
-        # standard FM: model predicts instantaneous velocity at t (r=t)
         r_input = r if mean_flow else t
-
         u_c = module.model(x, t, r_input, labels)
         if guidance_scale != 1.0:
             u_u = module.model(x, t, r_input, y_null)
@@ -164,41 +54,72 @@ def generate_samples(module, labels, num_steps, guidance_scale=1.0, mean_flow=Tr
     return x
 
 
+@torch.no_grad()
+def generate_samples_meanflow_dit(model, meanflow, labels, num_steps, device):
+    """Sampling for MeanFlow repo MFDiT (t=1 noise, t=0 data).
+
+    Uses meanflow.sample_each_class logic but with arbitrary labels.
+    """
+    bs = len(labels)
+    z = torch.randn(bs, meanflow.channels, meanflow.image_size, meanflow.image_size, device=device)
+    t_vals = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+
+    for i in range(num_steps):
+        t = torch.full((bs,), t_vals[i], device=device)
+        r = torch.full((bs,), t_vals[i + 1], device=device)
+        v = model(z, t, r, labels)
+        z = z - (t_vals[i] - t_vals[i + 1]) * v
+
+    z = meanflow.normer.unnorm(z)
+    return z
+
+
+# ── FID ──────────────────────────────────────────────────────────────────────
+
+
 def _to_inception_format(images):
-    """Convert from [-1,1] float (1,32,32) to [0,255] uint8 (3,299,299)."""
-    images = ((images + 1) / 2).clamp(0, 1)
+    """Convert [0,1] float (1,32,32) to [0,255] uint8 (3,299,299)."""
+    images = images.clamp(0, 1)
     images = images.repeat(1, 3, 1, 1)
     images = F.interpolate(images, size=(299, 299), mode="bilinear", align_corners=False)
     return (images * 255).to(torch.uint8)
 
 
-def evaluate_fid(
-    module, dataloader, num_gen=10000, num_steps=50, guidance_scale=1.0,
-    mean_flow=True, device="cpu",
-):
-    """Compute FID between real test images and generated samples."""
+def _to_inception_format_from_model_space(images):
+    """Convert [-1,1] float (1,32,32) to [0,255] uint8 (3,299,299)."""
+    images = ((images + 1) / 2).clamp(0, 1)
+    return _to_inception_format(images)
+
+
+def evaluate_fid(sample_fn, dataloader, num_gen=10000, device="cpu"):
+    """Compute FID between real test images and generated samples.
+
+    Args:
+        sample_fn: callable(batch_size) -> images in [0, 1] range, (bs, 1, 32, 32)
+        dataloader: test dataloader
+        num_gen: number of samples
+        device: device
+    """
     from torchmetrics.image.fid import FrechetInceptionDistance
 
-    module.eval()
     fid = FrechetInceptionDistance(feature=2048).to(device)
 
     # real images
     n_real = 0
     for x, _ in tqdm(dataloader, desc="FID (real)"):
-        x = _to_inception_format(x.to(device))
-        fid.update(x, real=True)
+        # dataloader images are in [-1, 1] (after Normalize(0.5, 0.5))
+        imgs = _to_inception_format_from_model_space(x.to(device))
+        fid.update(imgs, real=True)
         n_real += x.shape[0]
         if n_real >= num_gen:
             break
 
     # generated images
     n_fake = 0
-    batch_size = 250
     pbar = tqdm(total=num_gen, desc="FID (gen)")
     while n_fake < num_gen:
-        bs = min(batch_size, num_gen - n_fake)
-        labels = torch.randint(0, 10, (bs,), device=device)
-        samples = generate_samples(module, labels, num_steps, guidance_scale, mean_flow)
+        bs = min(250, num_gen - n_fake)
+        samples = sample_fn(bs)
         fid.update(_to_inception_format(samples), real=False)
         n_fake += bs
         pbar.update(bs)
@@ -207,66 +128,104 @@ def evaluate_fid(
     return fid.compute().item()
 
 
+# ── Model loading ────────────────────────────────────────────────────────────
+
+
+def load_lightning(checkpoint, model_type):
+    cls = MeanFlowModule if model_type == "mean_flow" else FlowMatchingModule
+    module = cls.load_from_checkpoint(checkpoint)
+    module.eval()
+    return module
+
+
+def load_meanflow_dit(checkpoint, device):
+    sys.path.insert(0, "../MeanFlow")
+    from models.dit import MFDiT
+    from meanflow import MeanFlow
+
+    model = MFDiT(
+        input_size=32,
+        patch_size=2,
+        in_channels=1,
+        dim=256,
+        depth=6,
+        num_heads=4,
+        num_classes=10,
+    ).to(device)
+    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
+    model.eval()
+
+    meanflow = MeanFlow(
+        channels=1,
+        image_size=32,
+        num_classes=10,
+        flow_ratio=0.50,
+        time_dist=["lognorm", -0.4, 1.0],
+        cfg_ratio=0.10,
+        cfg_scale=2.0,
+        cfg_uncond="u",
+    )
+
+    return model, meanflow
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate flow matching MNIST model")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--model_type", type=str, default="mean_flow",
-                        choices=["mean_flow", "flow_matching"],
-                        help="Which module to load")
-    parser.add_argument("--nll_steps", type=int, default=100, help="ODE steps for NLL")
-    parser.add_argument("--fid_steps", type=int, default=50, help="Sampling steps for FID")
-    parser.add_argument("--guidance", type=float, default=1.0, help="CFG scale (FID only)")
-    parser.add_argument("--num_gen", type=int, default=10000, help="Samples for FID")
-    parser.add_argument("--max_nll", type=int, default=1000, help="Max samples for NLL")
-    parser.add_argument("--skip_fid", action="store_true")
-    parser.add_argument("--skip_nll", action="store_true")
+    parser.add_argument(
+        "--model_type", type=str, default="mean_flow",
+        choices=["mean_flow", "flow_matching", "meanflow_dit"],
+    )
+    parser.add_argument("--fid_steps", type=int, default=50)
+    parser.add_argument("--guidance", type=float, default=1.0, help="CFG scale (lightning models only)")
+    parser.add_argument("--num_gen", type=int, default=10000)
     args = parser.parse_args()
 
-    mean_flow = args.model_type == "mean_flow"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
     print(f"Model type: {args.model_type}")
-
-    # load model
     print(f"Loading: {args.checkpoint}")
-    ModuleClass = MODULE_MAP[args.model_type]
-    module = ModuleClass.load_from_checkpoint(args.checkpoint)
-    module.eval().to(device)
 
     # load test data
     dm = MNISTDataModule(data_dir="./data", batch_size=250)
     dm.setup("test")
     test_dl = dm.test_dataloader()
 
-    # ── NLL / BPD ────────────────────────────────────────────────────────
-    if not args.skip_nll:
-        print(f"\n{'='*50}")
-        print(f"  NLL / BPD   (steps={args.nll_steps}, n<={args.max_nll})")
-        print(f"{'='*50}")
+    # build sample function that returns images in [0, 1]
+    if args.model_type in ("mean_flow", "flow_matching"):
+        module = load_lightning(args.checkpoint, args.model_type)
+        module.to(device)
+        mean_flow = args.model_type == "mean_flow"
 
-        res = evaluate_nll(module, test_dl, args.nll_steps, args.max_nll, device)
+        def sample_fn(bs):
+            labels = torch.randint(0, 10, (bs,), device=device)
+            imgs = generate_samples_lightning(
+                module, labels, args.fid_steps, args.guidance, mean_flow,
+            )
+            return ((imgs + 1) / 2).clamp(0, 1)  # [-1,1] -> [0,1]
 
-        print(f"  NLL  (nats):  {res['nll_mean']:.2f} +/- {res['nll_std']:.2f}")
-        print(f"  BPD:          {res['bpd_mean']:.4f} +/- {res['bpd_std']:.4f}")
-        print(f"  Samples:      {res['n_samples']}")
-        print()
-        print("  BPD accounts for [-1,1]->[0,1] Jacobian + 256-level discretization.")
-        print("  Comparable to paper values (e.g. ~1.0 for good MNIST models).")
+    elif args.model_type == "meanflow_dit":
+        model, meanflow = load_meanflow_dit(args.checkpoint, device)
+
+        def sample_fn(bs):
+            labels = torch.randint(0, 10, (bs,), device=device)
+            imgs = generate_samples_meanflow_dit(
+                model, meanflow, labels, args.fid_steps, device,
+            )
+            return imgs.clamp(0, 1)  # unnorm already gives [0,1]
 
     # ── FID ───────────────────────────────────────────────────────────────
-    if not args.skip_fid:
-        print(f"\n{'='*50}")
-        print(f"  FID   (steps={args.fid_steps}, guidance={args.guidance}, n={args.num_gen})")
-        print(f"{'='*50}")
+    print(f"\n{'='*50}")
+    print(f"  FID   (steps={args.fid_steps}, n={args.num_gen})")
+    if args.model_type != "meanflow_dit":
+        print(f"  guidance={args.guidance}")
+    print(f"{'='*50}")
 
-        fid_score = evaluate_fid(
-            module, test_dl, args.num_gen, args.fid_steps, args.guidance,
-            mean_flow, device,
-        )
-        print(f"  FID:  {fid_score:.2f}")
+    fid_score = evaluate_fid(sample_fn, test_dl, args.num_gen, device)
+    print(f"  FID:  {fid_score:.2f}")
 
 
 if __name__ == "__main__":
