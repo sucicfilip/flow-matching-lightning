@@ -19,8 +19,13 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from model.module import MeanFlowModule
+from model.module import MeanFlowModule, FlowMatchingModule
 from data_module import MNISTDataModule
+
+MODULE_MAP = {
+    "mean_flow": MeanFlowModule,
+    "flow_matching": FlowMatchingModule,
+}
 
 
 # ── NLL / BPD ────────────────────────────────────────────────────────────────
@@ -125,8 +130,12 @@ def evaluate_nll(module, dataloader, num_steps=100, max_samples=1000, device="cp
 
 
 @torch.no_grad()
-def generate_samples(module, labels, num_steps, guidance_scale=1.0):
-    """Generate images via mean flow ODE integration with optional CFG."""
+def generate_samples(module, labels, num_steps, guidance_scale=1.0, mean_flow=True):
+    """Generate images via ODE integration with optional CFG.
+
+    mean_flow=True:  r=t_next (mean velocity over [t, r] — enables big steps)
+    mean_flow=False: r=t      (instantaneous velocity — standard FM)
+    """
     device = next(module.parameters()).device
     bs = len(labels)
     y_null = torch.full_like(labels, 10)
@@ -138,14 +147,19 @@ def generate_samples(module, labels, num_steps, guidance_scale=1.0):
     for i in range(num_steps):
         t = t_sched[i].view(1, 1, 1, 1).expand(bs, 1, 1, 1)
         r = t_sched[i + 1].view(1, 1, 1, 1).expand(bs, 1, 1, 1)
+        dt = r - t
 
-        u_c = module.model(x, t, r, labels)
+        # mean flow: model predicts mean velocity over [t, r]
+        # standard FM: model predicts instantaneous velocity at t (r=t)
+        r_input = r if mean_flow else t
+
+        u_c = module.model(x, t, r_input, labels)
         if guidance_scale != 1.0:
-            u_u = module.model(x, t, r, y_null)
+            u_u = module.model(x, t, r_input, y_null)
             u = (1 - guidance_scale) * u_u + guidance_scale * u_c
         else:
             u = u_c
-        x = x + (r - t) * u
+        x = x + dt * u
 
     return x
 
@@ -159,7 +173,8 @@ def _to_inception_format(images):
 
 
 def evaluate_fid(
-    module, dataloader, num_gen=10000, num_steps=50, guidance_scale=1.0, device="cpu"
+    module, dataloader, num_gen=10000, num_steps=50, guidance_scale=1.0,
+    mean_flow=True, device="cpu",
 ):
     """Compute FID between real test images and generated samples."""
     from torchmetrics.image.fid import FrechetInceptionDistance
@@ -183,7 +198,7 @@ def evaluate_fid(
     while n_fake < num_gen:
         bs = min(batch_size, num_gen - n_fake)
         labels = torch.randint(0, 10, (bs,), device=device)
-        samples = generate_samples(module, labels, num_steps, guidance_scale)
+        samples = generate_samples(module, labels, num_steps, guidance_scale, mean_flow)
         fid.update(_to_inception_format(samples), real=False)
         n_fake += bs
         pbar.update(bs)
@@ -198,6 +213,9 @@ def evaluate_fid(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate flow matching MNIST model")
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--model_type", type=str, default="mean_flow",
+                        choices=["mean_flow", "flow_matching"],
+                        help="Which module to load")
     parser.add_argument("--nll_steps", type=int, default=100, help="ODE steps for NLL")
     parser.add_argument("--fid_steps", type=int, default=50, help="Sampling steps for FID")
     parser.add_argument("--guidance", type=float, default=1.0, help="CFG scale (FID only)")
@@ -207,12 +225,15 @@ def main():
     parser.add_argument("--skip_nll", action="store_true")
     args = parser.parse_args()
 
+    mean_flow = args.model_type == "mean_flow"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
+    print(f"Model type: {args.model_type}")
 
     # load model
     print(f"Loading: {args.checkpoint}")
-    module = MeanFlowModule.load_from_checkpoint(args.checkpoint)
+    ModuleClass = MODULE_MAP[args.model_type]
+    module = ModuleClass.load_from_checkpoint(args.checkpoint)
     module.eval().to(device)
 
     # load test data
@@ -242,7 +263,8 @@ def main():
         print(f"{'='*50}")
 
         fid_score = evaluate_fid(
-            module, test_dl, args.num_gen, args.fid_steps, args.guidance, device
+            module, test_dl, args.num_gen, args.fid_steps, args.guidance,
+            mean_flow, device,
         )
         print(f"  FID:  {fid_score:.2f}")
 
